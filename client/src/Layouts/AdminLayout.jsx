@@ -2,6 +2,7 @@ import React, { useEffect } from 'react'
 import { Outlet, Link } from 'react-router-dom'
 
 import AdminHeader from '../components/AdminHeader'
+import DraggableCalculator from '../components/DraggableCalculator'
 
 function AdminLayout({ title }) {
   useEffect(() => {
@@ -16,6 +17,7 @@ function AdminLayout({ title }) {
       <main  >
         <Outlet />
       </main>
+      <DraggableCalculator/>
     </div>
   )
 }
