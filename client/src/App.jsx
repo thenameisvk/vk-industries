@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { BrowserRouter, Routes, Route, Link, Navigate, Outlet } from 'react-router-dom';
+import { Analytics } from '@vercel/analytics/react';
 import './App.css';
 
 import nobg from './assets/brand-ad.webm'
@@ -266,6 +267,7 @@ export default function App() {
             <Route path="*" element={<NotFound title="VK | Page Not Found 404" />} />
           </Routes>
         </div>
+        <Analytics />
       </AuthProvider>
     </BrowserRouter>
   );
