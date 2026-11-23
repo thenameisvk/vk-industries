@@ -58,6 +58,10 @@ const msgTime = (iso) => {
    ===================================================================== */
 const EMPTY_MIX = { completed: 0, active: 0, dueSoon: 0, overdue: 0 };
 
+/* How often the dashboard re-reads the backend while the tab is visible.
+   (The API caches its heavy numbers for ~20 s, so 15 s keeps you at most one cycle behind.) */
+const LIVE_REFRESH_MS = 15000;
+
 function normalizeOverview(data) {
   const num = (v) => {
     const n = Number(v);
@@ -93,6 +97,20 @@ function normalizeOverview(data) {
   };
 }
 
+/** one chart request → always returns three arrays */
+async function fetchChart(range) {
+  const { data } = await API.get('/dashboard/chart', { params: { range } });
+  return {
+    labels:    Array.isArray(data?.labels)    ? data.labels    : [],
+    given:     Array.isArray(data?.given)     ? data.given     : [],
+    collected: Array.isArray(data?.collected) ? data.collected : [],
+  };
+}
+
+/** adds rupee amounts in whole paise, so 0.1 + 0.2 can never drift */
+const sumRupees = (list) =>
+  (Array.isArray(list) ? list : []).reduce((s, v) => s + Math.round((Number(v) || 0) * 100), 0) / 100;
+
 /* =====================================================================
    PAGE
    ===================================================================== */
@@ -105,40 +123,68 @@ function DashboardPage() {
   const [overview, setOverview] = useState(null);
   const [overviewError, setOverviewError] = useState('');
 
-  const loadOverview = useCallback(async () => {
+  /* live status shown next to the date */
+  const [lastUpdated, setLastUpdated] = useState(null);
+  const [failed, setFailed] = useState({ overview: false, chart: false });
+  const markFailed = useCallback((key, value) => {
+    setFailed((f) => (f[key] === value ? f : { ...f, [key]: value }));
+  }, []);
+  const liveError = failed.overview || failed.chart;
+
+  const overviewReq = useRef(0);
+  // silent = background refresh: keep the last good numbers on screen, no error banner
+  const loadOverview = useCallback(async ({ silent = false } = {}) => {
+    const id = ++overviewReq.current;
     try {
       const { data } = await API.get('/dashboard/overview');
+      if (id !== overviewReq.current) return;        // a newer request already answered
       setOverview(normalizeOverview(data));
       setOverviewError('');
+      markFailed('overview', false);
+      setLastUpdated(new Date());
     } catch (err) {
-      setOverviewError(errorMessage(err, 'Could not load the dashboard numbers.'));
+      if (id !== overviewReq.current) return;
+      markFailed('overview', true);
+      if (!silent) setOverviewError(errorMessage(err, 'Could not load the dashboard numbers.'));
     }
-  }, []);
+  }, [markFailed]);
 
-  /* ---------- chart ---------- */
+  /* ---------- revenue chart + monthly revenue (always read from the API) ---------- */
   const [range, setRange] = useState('month');
-  const [chart, setChart] = useState(null);
+  const [chart, setChart] = useState(null);             // the range picked in the dropdown
+  const [monthChart, setMonthChart] = useState(null);   // always "this month" → powers Monthly revenue
+  const rangeRef = useRef(range);
+  rangeRef.current = range;
+  const chartReq = useRef(0);
 
-  useEffect(() => {
-    let alive = true;
-    setChart(null); // reset on range change so skeleton shows
-    API.get('/dashboard/chart', { params: { range } })
-      .then(({ data }) => {
-        if (!alive) return;
-        // Defensive: ensure arrays exist
-        setChart({
-          labels:    Array.isArray(data?.labels)    ? data.labels    : [],
-          given:     Array.isArray(data?.given)     ? data.given     : [],
-          collected: Array.isArray(data?.collected) ? data.collected : [],
-        });
-      })
-      .catch((err) => {
-        if (!alive) return;
-        setChart({ labels: [], given: [], collected: [] });
+  const loadCharts = useCallback(async ({ silent = false } = {}) => {
+    const id = ++chartReq.current;
+    const wanted = rangeRef.current;
+    try {
+      const [main, month] = await Promise.all([
+        fetchChart(wanted),
+        wanted === 'month' ? null : fetchChart('month'),  // one request when they are the same
+      ]);
+      if (id !== chartReq.current) return;                 // ignore out-of-order answers
+      setChart(main);
+      setMonthChart(month || main);
+      markFailed('chart', false);
+      setLastUpdated(new Date());
+    } catch (err) {
+      if (id !== chartReq.current) return;
+      markFailed('chart', true);
+      if (!silent) {
+        setChart((c) => c || { labels: [], given: [], collected: [] });
         toast.error(errorMessage(err, 'Could not load the chart.'));
-      });
-    return () => { alive = false; };
-  }, [range, toast]);
+      }
+    }
+  }, [toast, markFailed]);
+
+  // dropdown changed → show the skeleton for the new range, then load it
+  useEffect(() => {
+    setChart(null);
+    loadCharts();
+  }, [range, loadCharts]);
 
   const barData = useMemo(() => ({
     labels: chart?.labels || [],
@@ -245,12 +291,12 @@ function DashboardPage() {
   const [uStatus, setUStatus] = useState('all');
   const [viewUser, setViewUser] = useState(null);
 
-  const loadUsers = useCallback(async () => {
+  const loadUsers = useCallback(async ({ silent = false } = {}) => {
     try {
       const { data } = await API.get('/dashboard/recent-users', { params: { limit: 5 } });
       setUsers(Array.isArray(data?.items) ? data.items : []);
     } catch (err) {
-      toast.error(errorMessage(err, 'Could not load recent users.'));
+      if (!silent) toast.error(errorMessage(err, 'Could not load recent users.'));
       setUsers((u) => u || []);
     }
   }, [toast]);
@@ -276,8 +322,7 @@ function DashboardPage() {
     try {
       await API.delete(`/settings/customers/${u.id}`);
       toast.success(`${u.name} was deleted.`, { title: 'Deleted' });
-      loadUsers();
-      loadOverview();
+      refreshLive({ silent: true, force: true });   // revenue / balance / charts may have changed
     } catch (err) {
       toast.error(errorMessage(err));
     }
@@ -317,6 +362,7 @@ function DashboardPage() {
 
   /* ---------- initial load + refresh ---------- */
   const [refreshing, setRefreshing] = useState(false);
+  // first load (the charts load through their own effect above)
   const refreshAll = useCallback(async () => {
     setRefreshing(true);
     await Promise.all([loadOverview(), loadUsers(), loadMessages()]);
@@ -325,10 +371,40 @@ function DashboardPage() {
 
   useEffect(() => { refreshAll(); }, [refreshAll]);
 
+  /* LIVE refresh: overview numbers + revenue chart + recent users + messages.
+     silent  → no spinner / no error toasts (used by the timer)
+     force   → skip the small anti-spam delay (used by buttons and events)        */
+  const lastRun = useRef(0);
+  const refreshLive = useCallback(async ({ silent = true, force = false } = {}) => {
+    if (!force && Date.now() - lastRun.current < 3000) return;
+    lastRun.current = Date.now();
+    if (!silent) setRefreshing(true);
+    try {
+      await Promise.all([
+        loadOverview({ silent }),
+        loadCharts({ silent }),
+        loadUsers({ silent }),
+        loadMessages(),
+      ]);
+    } finally {
+      if (!silent) setRefreshing(false);
+    }
+  }, [loadOverview, loadCharts, loadUsers, loadMessages]);
+
   useEffect(() => {
-    const t = setInterval(loadMessages, 30000);
-    return () => clearInterval(t);
-  }, [loadMessages]);
+    const whenVisible = () => { if (!document.hidden) refreshLive({ silent: true }); };
+    const whenOnline = () => refreshLive({ silent: true, force: true });
+    const timer = setInterval(whenVisible, LIVE_REFRESH_MS);     // every 15 s, only while the tab is visible
+    document.addEventListener('visibilitychange', whenVisible);  // back on this tab → refresh now
+    window.addEventListener('focus', whenVisible);
+    window.addEventListener('online', whenOnline);               // connection restored → refresh now
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', whenVisible);
+      window.removeEventListener('focus', whenVisible);
+      window.removeEventListener('online', whenOnline);
+    };
+  }, [refreshLive]);
 
   /* ---------- calendar (events come from the server for the visible range) ---------- */
   const calRef = useRef(null);
@@ -498,13 +574,19 @@ function DashboardPage() {
   }, []);
 
   /* ---------- stat cards ---------- */
+  const monthlyRevenue = monthChart ? sumRupees(monthChart.collected) : null;
+  const monthName = now.toLocaleDateString('en-IN', { month: 'long', year: 'numeric' });
+
+  // NOTE: values are set explicitly (no spreading the raw API object) so the
+  // formatted ₹ text can never be overwritten by the plain number.
   const stats = overview ? [
     {
       key: 'users',
       label: 'Total users',
       value: overview.users.value.toLocaleString('en-IN'),
       icon: 'bi-people-fill',
-      ...overview.users,
+      trend: overview.users.trend,
+      note: overview.users.note,
       tone: 'good',
     },
     {
@@ -512,7 +594,17 @@ function DashboardPage() {
       label: 'Total revenue',
       value: formatINR(overview.revenue.value),
       icon: 'bi-currency-rupee',
-      ...overview.revenue,
+      trend: overview.revenue.trend,
+      note: overview.revenue.note,
+      tone: 'good',
+    },
+    {
+      key: 'monthly',
+      label: 'Monthly revenue',
+      value: monthlyRevenue === null ? '—' : formatINR(monthlyRevenue),
+      icon: 'bi-calendar2-check',
+      trend: overview.revenue.trend,                 // this month vs last month
+      note: `collected in ${monthName}`,
       tone: 'good',
     },
     {
@@ -520,7 +612,8 @@ function DashboardPage() {
       label: 'Total balance',
       value: formatINR(overview.balance.value),
       icon: 'bi-wallet2',
-      ...overview.balance,
+      trend: overview.balance.trend,
+      note: overview.balance.note,
       tone: 'neutral',
     },
   ] : [];
@@ -540,13 +633,25 @@ function DashboardPage() {
         <header className="adm-page-head">
           <div>
             <h1 className="adm-title">Dashboard</h1>
-            <p className="adm-subtitle">{liveDate}</p>
+            <p className="adm-subtitle">
+              {liveDate}
+              <span
+                role="status"
+                style={{ marginLeft: 14, fontSize: '0.8rem', color: liveError ? '#ffb020' : '#22d38a' }}
+              >
+                {liveError
+                  ? '● Connection issue · showing last data'
+                  : lastUpdated
+                    ? `● Live · updated ${lastUpdated.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`
+                    : '● Loading…'}
+              </span>
+            </p>
           </div>
           <div className="db-head-actions">
             <button
               type="button"
               className="adm-btn"
-              onClick={refreshAll}
+              onClick={() => refreshLive({ silent: false, force: true })}
               disabled={refreshing}
             >
               <i className={`bi bi-arrow-repeat ${refreshing ? 'adm-spin' : ''}`} /> Refresh
@@ -565,7 +670,7 @@ function DashboardPage() {
           <div className="adm-alert" role="alert">
             <i className="bi bi-exclamation-triangle-fill" />
             <span>{overviewError}</span>
-            <button type="button" className="adm-btn adm-btn--sm" onClick={loadOverview}>
+            <button type="button" className="adm-btn adm-btn--sm" onClick={() => loadOverview()}>
               Try again
             </button>
           </div>
@@ -587,7 +692,7 @@ function DashboardPage() {
                 </span>
                 <div>
                   <p className="db-stat-label">{s.label}</p>
-                  <p className="db-stat-value">{s.value}</p>
+                  <p className="db-stat-value" aria-live="polite">{s.value}</p>
                   <span className={`db-trend ${cls}`}>
                     {s.trend !== null && s.trend !== 0 && (
                       <i className={`bi ${s.trend > 0 ? 'bi-arrow-up-right' : 'bi-arrow-down-right'}`} />
@@ -642,7 +747,7 @@ function DashboardPage() {
             <div className="db-charts">
               <div className="adm-card">
                 <div className="adm-card-head">
-                  <h3><i className="bi bi-bar-chart-line-fill" /> Cash given vs collected</h3>
+                  <h3><i className="bi bi-bar-chart-line-fill" /> Revenue · cash given vs collected</h3>
                   <select
                     className="adm-select db-range"
                     value={range}
@@ -654,6 +759,12 @@ function DashboardPage() {
                     ))}
                   </select>
                 </div>
+                {chart && (
+                  <p className="adm-help" style={{ margin: '0 0 12px' }}>
+                    Collected in this period: <strong>{formatINR(sumRupees(chart.collected))}</strong>
+                    {' · '}Given: <strong>{formatINR(sumRupees(chart.given))}</strong>
+                  </p>
+                )}
                 <div className="db-chart-canvas">
                   {chart ? <Bar data={barData} options={barOptions} /> : <div className="adm-skel adm-skel--fill" />}
                 </div>
