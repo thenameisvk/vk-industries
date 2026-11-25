@@ -22,7 +22,7 @@ ChartJS.defaults.color = '#b0b0bd';
 /* =====================================================================
    CONSTANTS
    ===================================================================== */
-const RANGES = { month: 'This month', quarter: 'Last 3 months', year: 'This year' };
+const RANGES = { month: 'This month (daily)', quarter: 'Last 3 months', year: 'This year' };
 const MIX = [
   { key: 'completed', label: 'Completed', color: '#22d38a' },
   { key: 'active',    label: 'On track',  color: '#5aa9ff' },
@@ -62,6 +62,14 @@ const EMPTY_MIX = { completed: 0, active: 0, dueSoon: 0, overdue: 0 };
    (The API caches its heavy numbers for ~20 s, so 15 s keeps you at most one cycle behind.) */
 const LIVE_REFRESH_MS = 15000;
 
+/* The API must never answer a dashboard request with an empty body. If it does,
+   say so clearly instead of silently showing zeros. */
+const emptyReply = (what) => Object.assign(
+  new Error(`The server sent back no ${what}. Update server/utils/cache.js and server/routes/dashboard.js, then restart the API.`),
+  { isEmpty: true },
+);
+const explain = (err, fallback) => (err && err.isEmpty ? err.message : errorMessage(err, fallback));
+
 function normalizeOverview(data) {
   const num = (v) => {
     const n = Number(v);
@@ -78,6 +86,11 @@ function normalizeOverview(data) {
       trend: trend(data?.users?.trend),
       note:  data?.users?.note  || 'vs last month',
     },
+    given: data?.given
+      ? { value: num(data.given.value), trend: trend(data.given.trend), note: data.given.note || 'cash given, all time' }
+      : null,
+    today: { collected: num(data?.today?.collected), given: num(data?.today?.given) },
+    date: typeof data?.date === 'string' ? data.date : '',
     revenue: {
       value: num(data?.revenue?.value),
       trend: trend(data?.revenue?.trend),
@@ -100,6 +113,7 @@ function normalizeOverview(data) {
 /** one chart request → always returns three arrays */
 async function fetchChart(range) {
   const { data } = await API.get('/dashboard/chart', { params: { range } });
+  if (!data || !Array.isArray(data.labels)) throw emptyReply('chart data');
   return {
     labels:    Array.isArray(data?.labels)    ? data.labels    : [],
     given:     Array.isArray(data?.given)     ? data.given     : [],
@@ -138,6 +152,7 @@ function DashboardPage() {
     try {
       const { data } = await API.get('/dashboard/overview');
       if (id !== overviewReq.current) return;        // a newer request already answered
+      if (!data || typeof data !== 'object' || !data.revenue || !data.balance) throw emptyReply('dashboard numbers');
       setOverview(normalizeOverview(data));
       setOverviewError('');
       markFailed('overview', false);
@@ -145,7 +160,7 @@ function DashboardPage() {
     } catch (err) {
       if (id !== overviewReq.current) return;
       markFailed('overview', true);
-      if (!silent) setOverviewError(errorMessage(err, 'Could not load the dashboard numbers.'));
+      if (!silent) setOverviewError(explain(err, 'Could not load the dashboard numbers.'));
     }
   }, [markFailed]);
 
@@ -175,7 +190,7 @@ function DashboardPage() {
       markFailed('chart', true);
       if (!silent) {
         setChart((c) => c || { labels: [], given: [], collected: [] });
-        toast.error(errorMessage(err, 'Could not load the chart.'));
+        toast.error(explain(err, 'Could not load the chart.'));
       }
     }
   }, [toast, markFailed]);
@@ -230,11 +245,18 @@ function DashboardPage() {
       },
       tooltip: {
         ...tooltipStyle,
-        callbacks: { label: (c) => ` ${c.dataset.label}: ${formatINR(c.parsed.y)}` },
+        callbacks: {
+          title: (items) => (range === 'month' && items[0] ? `Day ${items[0].label}` : items[0]?.label),
+          label: (c) => ` ${c.dataset.label}: ${formatINR(c.parsed.y)}`,
+        },
       },
     },
     scales: {
-      x: { ticks: { color: '#9a9aa8' }, grid: { display: false } },
+      x: {
+        title: { display: range === 'month', text: 'Day of the month', color: '#9a9aa8' },
+        ticks: { color: '#9a9aa8', autoSkip: true, maxRotation: 0 },
+        grid: { display: false },
+      },
       y: {
         beginAtZero: true,
         ticks: {
@@ -244,7 +266,7 @@ function DashboardPage() {
         grid: { color: 'rgba(255,255,255,0.06)' },
       },
     },
-  }), []); // eslint-disable-line react-hooks/exhaustive-deps
+  }), [range]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ---------- status mix (SAFE) ---------- */
   const mixTotal = useMemo(() => {
@@ -405,6 +427,17 @@ function DashboardPage() {
       window.removeEventListener('online', whenOnline);
     };
   }, [refreshLive]);
+
+  /* A new day (India time) starts at 00:00: refresh by itself a moment after midnight so
+     "Today's collection" and the daily chart roll over without touching the page.
+     (Re-armed after every refresh; waking from sleep is covered by the focus/visible refresh.) */
+  useEffect(() => {
+    const IST = 19800000;
+    const DAY = 86400000;
+    const msToMidnight = DAY - ((Date.now() + IST) % DAY);
+    const id = setTimeout(() => refreshLive({ silent: true, force: true }), msToMidnight + 2000);
+    return () => clearTimeout(id);
+  }, [refreshLive, lastUpdated]);
 
   /* ---------- calendar (events come from the server for the visible range) ---------- */
   const calRef = useRef(null);
@@ -579,6 +612,9 @@ function DashboardPage() {
 
   // NOTE: values are set explicitly (no spreading the raw API object) so the
   // formatted ₹ text can never be overwritten by the plain number.
+  const todayLabel = overview?.date ? formatDate(overview.date) : '';
+
+  // values are set explicitly (never spread from the raw API object) so the formatted ₹ text is never overwritten
   const stats = overview ? [
     {
       key: 'users',
@@ -590,6 +626,15 @@ function DashboardPage() {
       tone: 'good',
     },
     {
+      key: 'given',
+      label: 'Total money given',
+      value: overview.given ? formatINR(overview.given.value) : '—',
+      icon: 'bi-cash-stack',
+      trend: overview.given ? overview.given.trend : null,
+      note: overview.given ? overview.given.note : 'update the API to see this',
+      tone: 'plain',
+    },
+    {
       key: 'revenue',
       label: 'Total revenue',
       value: formatINR(overview.revenue.value),
@@ -597,6 +642,15 @@ function DashboardPage() {
       trend: overview.revenue.trend,
       note: overview.revenue.note,
       tone: 'good',
+    },
+    {
+      key: 'balance',
+      label: 'Total outstanding',
+      value: formatINR(overview.balance.value),
+      icon: 'bi-wallet2',
+      trend: overview.balance.trend,
+      note: overview.balance.note,
+      tone: 'neutral',
     },
     {
       key: 'monthly',
@@ -608,18 +662,20 @@ function DashboardPage() {
       tone: 'good',
     },
     {
-      key: 'balance',
-      label: 'Total balance',
-      value: formatINR(overview.balance.value),
-      icon: 'bi-wallet2',
-      trend: overview.balance.trend,
-      note: overview.balance.note,
-      tone: 'neutral',
+      key: 'today',
+      label: "Today's collection",
+      value: formatINR(overview.today.collected),
+      icon: 'bi-calendar-day',
+      hideTrend: true,
+      note: overview.today.given > 0
+        ? `${formatINR(overview.today.given)} given today · ${todayLabel}`
+        : todayLabel || 'today',
+      tone: 'good',
     },
   ] : [];
 
   const trendClass = (s) => {
-    if (s.trend === null || s.trend === 0) return 'flat';
+    if (s.tone === 'plain' || s.trend === null || s.trend === 0) return 'flat';
     if (s.tone === 'neutral') return s.trend > 0 ? 'warn' : 'up';
     return s.trend > 0 ? 'up' : 'down';
   };
@@ -693,6 +749,7 @@ function DashboardPage() {
                 <div>
                   <p className="db-stat-label">{s.label}</p>
                   <p className="db-stat-value" aria-live="polite">{s.value}</p>
+                  {!s.hideTrend && (
                   <span className={`db-trend ${cls}`}>
                     {s.trend !== null && s.trend !== 0 && (
                       <i className={`bi ${s.trend > 0 ? 'bi-arrow-up-right' : 'bi-arrow-down-right'}`} />
@@ -703,6 +760,7 @@ function DashboardPage() {
                         ? 'No change this month'
                         : `${Math.abs(s.trend)}% vs last month`}
                   </span>
+                  )}
                   <p className="db-stat-note">{s.note}</p>
                 </div>
               </article>
