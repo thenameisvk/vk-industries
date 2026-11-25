@@ -66,16 +66,35 @@ class MemoryCache {
     return true;
   }
 
-  /** Remember pattern: return cached value or compute + cache it */
-  async remember(key, ttlMs, producer) {
+  /** Remember pattern: return the cached value, or compute it once and cache it.
+   *  Accepts BOTH call styles so an old caller can never get `undefined` back:
+   *     remember(key, producer)              → default TTL
+   *     remember(key, ttlMs, producer)       → explicit TTL
+   *  Requests that arrive while the value is being computed share ONE computation. */
+  async remember(key, ttlOrProducer, maybeProducer) {
+    let ttlMs = this.defaultTTL;
+    let producer = maybeProducer;
+    if (typeof ttlOrProducer === 'number') ttlMs = ttlOrProducer;
+    else if (maybeProducer === undefined) producer = ttlOrProducer;   // remember(key, producer|value)
+
     const cached = this.get(key);
     if (cached !== undefined) return cached;
 
-    // producer can be a function or a plain value
-    const value = typeof producer === 'function' ? await producer() : producer;
-    // don't cache undefined/null to avoid sticky negatives
-    if (value !== undefined && value !== null) this.set(key, value, ttlMs);
-    return value;
+    if (!this._pending) this._pending = new Map();
+    if (this._pending.has(key)) return this._pending.get(key);
+
+    const job = (async () => {
+      const value = typeof producer === 'function' ? await producer() : producer;
+      // never cache undefined/null (a failed or empty result must not stick)
+      if (value !== undefined && value !== null) this.set(key, value, ttlMs);
+      return value;
+    })();
+    this._pending.set(key, job);
+    try {
+      return await job;
+    } finally {
+      this._pending.delete(key);
+    }
   }
 
   /* ---------- housekeeping ---------- */
