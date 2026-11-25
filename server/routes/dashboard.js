@@ -1,7 +1,7 @@
 'use strict';
 /* =====================================================================
    /api/dashboard — admin overview, charts, calendar, messages.
-   Every route is ADMIN-ONLY. Heavy numbers are cached for 20 s and the
+   Every route is ADMIN-ONLY. Heavy numbers are cached for 10 s and the
    cache is cleared automatically after any admin write.
    ===================================================================== */
 const express = require('express');
@@ -21,24 +21,37 @@ const V = require('../utils/validators');
 const router = express.Router();
 router.use(requireAdmin);
 
+const CACHE_MS = 10000;   // numbers are re-read from MongoDB at most every 10 s (and instantly after any admin write)
+
 const pct = (cur, prev) => (prev > 0 ? Math.round(((cur - prev) * 1000) / prev) / 10 : null); // 1 decimal; null = no baseline
 const istMonth = (now) => { const [y, mo] = M.istParts(now).date.split('-').map(Number); return { y, m: mo - 1 }; };
 const monthStartInstant = (y, m) => new Date(Date.UTC(y, m, 1) - M.IST); // 00:00 IST on the 1st (month may be −1 → Dec of last year)
 
 /* =====================================================================
-   GET /overview — stat cards + account-status mix
-   • Total users     = customers; trend = new this month vs new last month
-   • Total revenue   = all money collected; trend = collected this month vs last
-   • Total balance   = outstanding receivable (incl. late interest, net of rebate);
-                       trend = outstanding now vs outstanding at the start of
-                       THIS month (each loan re-evaluated as of that instant)
+   GET /overview — the stat cards
+   • users     = customers; trend = new this month vs new last month
+   • given     = TOTAL MONEY GIVEN: principal of every cash entry that has started;
+                 trend = given this month vs last month
+   • revenue   = TOTAL REVENUE: all money collected; trend = this month vs last
+   • balance   = TOTAL OUTSTANDING: still to collect (incl. late interest, net of
+                 rebate) for entries that have started; trend = now vs start of month
+   • today     = what happened TODAY (India date): collected + newly given
+   • statusMix = how many cash entries are completed / on track / ending soon / overdue
+   Everything is summed in integer paise and converted to rupees at the very end.
+   The cache key contains today's India date, so a new day always starts fresh.
    ===================================================================== */
 router.get('/overview', asyncHandler(async (req, res) => {
-  const data = await cache.remember('overview', async () => {
+  const todayISO = M.istParts(new Date()).date;
+
+  const data = await cache.remember(`overview:${todayISO}`, CACHE_MS, async () => {
     const now = new Date();
     const { y, m } = istMonth(now);
-    const thisStart = monthStartInstant(y, m);
+    const thisStart = monthStartInstant(y, m);                 // instants (payments, sign-ups)
     const prevStart = monthStartInstant(y, m - 1);
+    const todayStart = M.istInstant(todayISO);                 // 00:00 India time today
+    const thisStartDay = new Date(Date.UTC(y, m, 1));          // date-only values (cash start dates)
+    const prevStartDay = new Date(Date.UTC(y, m - 1, 1));
+    const todayDay = M.parseDateOnly(todayISO);
 
     const [loans, userCount, newThis, newPrev] = await Promise.all([
       Cash.find({}).select('principal interest schedule installment startDate endDate closed payments.amount payments.at').lean(),
@@ -47,32 +60,46 @@ router.get('/overview', asyncHandler(async (req, res) => {
       User.countDocuments({ joined: { $gte: prevStart, $lt: thisStart } }),
     ]);
 
-    let collected = 0, collectedThis = 0, collectedPrev = 0;
+    let collected = 0, collectedThis = 0, collectedPrev = 0, collectedToday = 0;
+    let given = 0, givenThis = 0, givenPrev = 0, givenToday = 0;
     let outstanding = 0, outstandingAtMonthStart = 0;
     const mix = { completed: 0, active: 0, dueSoon: 0, overdue: 0 };
 
     loans.forEach((loan) => {
       const ev = M.evaluate(loan, now, env.MATH);
-      outstanding += ev.balance;
+
       if (ev.status === 'completed') mix.completed += 1;
       else if (ev.status === 'overdue') mix.overdue += 1;
       else if (ev.status === 'due-soon') mix.dueSoon += 1;
       else mix.active += 1;
 
+      if (ev.started) {                                        // an entry dated in the future has not been given yet
+        outstanding += ev.balance;
+        given += loan.principal;
+        if (loan.startDate >= thisStartDay) givenThis += loan.principal;
+        else if (loan.startDate >= prevStartDay) givenPrev += loan.principal;
+        if (loan.startDate.getTime() === todayDay.getTime()) givenToday += loan.principal;
+      }
+
       const before = M.evaluate(loan, thisStart, env.MATH);
       if (before.started) outstandingAtMonthStart += before.balance;
 
-      loan.payments.forEach((p) => {
+      (loan.payments || []).forEach((p) => {
         collected += p.amount;
+        if (p.at >= todayStart) collectedToday += p.amount;
         if (p.at >= thisStart && p.at <= now) collectedThis += p.amount;
         else if (p.at >= prevStart && p.at < thisStart) collectedPrev += p.amount;
       });
     });
 
     return {
+      asOf: now.toISOString(),
+      date: todayISO,
       users: { value: userCount, trend: pct(newThis, newPrev), note: `${newThis} new this month` },
+      given: { value: M.toRupees(given), trend: pct(givenThis, givenPrev), note: 'cash given, all time' },
       revenue: { value: M.toRupees(collected), trend: pct(collectedThis, collectedPrev), note: 'collected, all time' },
       balance: { value: M.toRupees(outstanding), trend: pct(outstanding, outstandingAtMonthStart), note: 'outstanding to collect' },
+      today: { collected: M.toRupees(collectedToday), given: M.toRupees(givenToday) },
       statusMix: mix,
     };
   });
@@ -87,7 +114,14 @@ function chartSpec(range, now) {
   const { y, m } = istMonth(now);
   const monthName = (k) => new Date(Date.UTC(y, k, 1)).toLocaleString('en-US', { month: 'short', timeZone: 'UTC' });
   if (range === 'month') {
-    return { s: Date.UTC(y, m, 1), e: Date.UTC(y, m + 1, 1), labels: ['Week 1', 'Week 2', 'Week 3', 'Week 4'], bucket: (d) => Math.min(3, Math.floor((d.getUTCDate() - 1) / 7)) };
+    // one bar per day, from the 1st up to TODAY (India date) — a new bar appears every day
+    const today = Number(M.istParts(now).date.slice(8, 10));
+    return {
+      s: Date.UTC(y, m, 1),
+      e: Date.UTC(y, m, today + 1),
+      labels: Array.from({ length: today }, (_, k) => String(k + 1)),
+      bucket: (d) => d.getUTCDate() - 1,
+    };
   }
   if (range === 'quarter') {
     const s = Date.UTC(y, m - 2, 1);
@@ -103,7 +137,7 @@ function chartSpec(range, now) {
 
 router.get('/chart', validate({ query: V.chartQuery }), asyncHandler(async (req, res) => {
   const { range } = req.valid.query;
-  const out = await cache.remember(`chart:${range}`, async () => {
+  const out = await cache.remember(`chart:${range}:${M.istParts(new Date()).date}`, CACHE_MS, async () => {
     const now = new Date();
     const { s, e, labels, bucket } = chartSpec(range, now);
     const loans = await Cash.find({
@@ -124,7 +158,7 @@ router.get('/chart', validate({ query: V.chartQuery }), asyncHandler(async (req,
         if (t >= s && t < e) collected[bucket(shifted)] += p.amount;
       });
     });
-    return { range, labels, given: given.map(M.toRupees), collected: collected.map(M.toRupees) };
+    return { range, unit: range === 'month' ? 'day' : 'month', labels, given: given.map(M.toRupees), collected: collected.map(M.toRupees) };
   });
   res.json(out);
 }));
